@@ -20,6 +20,7 @@ import {
 } from '../users.js';
 import { DEFAULT_USER } from '../constants.js';
 import systemMonitor from '../system-monitor.js';
+import { isEmailServiceAvailable, sendInactiveUserDeletionNotice } from '../email-service.js';
 
 
 export const router = express.Router();
@@ -549,6 +550,8 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
             }
 
             const timeSinceLastActivity = now - lastActivityTime;
+            const daysSinceLastActivity = Math.floor(timeSinceLastActivity / (24 * 60 * 60 * 1000));
+            const hasBoundEmail = typeof user.email === 'string' && user.email.trim().length > 0;
 
             // 如果超过60天未登录
             if (timeSinceLastActivity > inactiveThreshold) {
@@ -560,13 +563,33 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
                     name: user.name,
                     lastActivity: lastActivityTime,
                     lastActivityFormatted: new Date(lastActivityTime).toLocaleString('zh-CN'),
-                    daysSinceLastActivity: Math.floor(timeSinceLastActivity / (24 * 60 * 60 * 1000)),
+                    daysSinceLastActivity: daysSinceLastActivity,
                     storageSize: storageSize,
+                    hasEmail: hasBoundEmail,
                 });
 
                 // 如果不是试运行模式，执行删除
                 if (!dryRun) {
                     try {
+                        let emailNotified = false;
+                        let emailError = null;
+
+                        if (hasBoundEmail) {
+                            if (isEmailServiceAvailable()) {
+                                const sent = await sendInactiveUserDeletionNotice(
+                                    user.email.trim(),
+                                    user.name,
+                                    daysSinceLastActivity,
+                                );
+                                emailNotified = sent;
+                                if (!sent) {
+                                    emailError = 'Failed to send notification email';
+                                }
+                            } else {
+                                emailError = 'Email service not available';
+                            }
+                        }
+
                         // 删除用户记录
                         await storage.removeItem(toKey(user.handle));
 
@@ -584,6 +607,8 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
                             name: user.name,
                             success: true,
                             deletedSize: storageSize,
+                            emailNotified: emailNotified,
+                            emailError: emailError,
                             message: `已删除用户 ${user.handle}，释放 ${(storageSize / 1024 / 1024).toFixed(2)} MB 空间`,
                         });
 
@@ -595,6 +620,8 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
                             name: user.name,
                             success: false,
                             error: error.message,
+                            emailNotified: emailNotified,
+                            emailError: emailError,
                         });
                     }
                 }

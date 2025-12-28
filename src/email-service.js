@@ -367,6 +367,90 @@ SillyTavern 团队
 }
 
 /**
+ * 发送因长期未登录被删除账户的通知邮件
+ * @param {string} to 收件人邮箱
+ * @param {string} userName 用户名
+ * @param {number} daysInactive 未登录天数
+ * @returns {Promise<boolean>} 是否发送成功
+ */
+export async function sendInactiveUserDeletionNotice(to, userName, daysInactive) {
+    const subject = 'SillyTavern - 账户删除通知';
+    const text = `
+尊敬的 ${userName}，
+
+由于您已超过 ${daysInactive} 天未登录，系统已按照管理策略删除您的账户数据。
+
+如果这不是您本人的情况，请尽快联系管理员。
+
+祝好，
+SillyTavern 团队
+    `.trim();
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background-color: #f39c12;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            border-radius: 5px 5px 0 0;
+        }
+        .content {
+            background-color: #f9f9f9;
+            padding: 30px;
+            border: 1px solid #ddd;
+            border-top: none;
+        }
+        .notice {
+            background-color: #fff3cd;
+            border-left: 4px solid #f39c12;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .footer {
+            background-color: #f0f0f0;
+            padding: 15px;
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            border-radius: 0 0 5px 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>账户删除通知</h1>
+    </div>
+    <div class="content">
+        <p>尊敬的 <strong>${userName}</strong>，</p>
+        <div class="notice">
+            <p>由于您已超过 <strong>${daysInactive}</strong> 天未登录，系统已按照管理策略删除您的账户数据。</p>
+        </div>
+        <p>如果这不是您本人的情况，请尽快联系管理员。</p>
+    </div>
+    <div class="footer">
+        <p>此邮件由 SillyTavern 系统自动发送，请勿回复。</p>
+    </div>
+</body>
+</html>
+    `.trim();
+
+    return await sendEmail(to, subject, text, html);
+}
+
+/**
  * 测试邮件配置
  * @param {string} testEmail 测试邮箱地址
  * @returns {Promise<{success: boolean, error?: string}>} 测试结果
