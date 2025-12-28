@@ -570,10 +570,10 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
 
                 // 如果不是试运行模式，执行删除
                 if (!dryRun) {
-                    try {
-                        let emailNotified = false;
-                        let emailError = null;
+                    let emailNotified = false;
+                    let emailError = null;
 
+                    try {
                         if (hasBoundEmail) {
                             if (isEmailServiceAvailable()) {
                                 const sent = await sendInactiveUserDeletionNotice(
