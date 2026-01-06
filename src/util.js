@@ -756,6 +756,177 @@ export class Cache {
 }
 
 /**
+ * Bounded TTL memory cache with optional background pruning.
+ * - TTL is enforced on reads (get/has) and via optional periodic prune.
+ * - maxEntries provides a hard upper bound to prevent unbounded growth / DoS.
+ */
+export class BoundedCache {
+    /**
+     * @param {{ ttlMs?: number, maxEntries?: number, sweepIntervalMs?: number }} [options]
+     */
+    constructor(options = {}) {
+        /** @type {Map<any, { value: any, expiresAt: number | null }>} */
+        this.cache = new Map();
+        this.ttlMs = Number.isFinite(options.ttlMs) ? Number(options.ttlMs) : 0;
+        this.maxEntries = Number.isFinite(options.maxEntries) ? Number(options.maxEntries) : 0;
+        this.sweepIntervalMs = Number.isFinite(options.sweepIntervalMs) ? Number(options.sweepIntervalMs) : 0;
+
+        /** @type {NodeJS.Timeout | null} */
+        this.#sweepInterval = null;
+
+        // Only schedule background sweeping when it can actually remove expired entries.
+        if (this.ttlMs > 0 && this.sweepIntervalMs > 0) {
+            this.#sweepInterval = setInterval(() => {
+                try {
+                    this.pruneExpired();
+                } catch (error) {
+                    console.error('BoundedCache pruneExpired failed:', error);
+                }
+            }, this.sweepIntervalMs);
+
+            // Do not keep the process alive because of this timer.
+            if (typeof this.#sweepInterval.unref === 'function') {
+                this.#sweepInterval.unref();
+            }
+        }
+    }
+
+    /** @type {NodeJS.Timeout | null} */
+    #sweepInterval;
+
+    /**
+     * Gets a value from the cache.
+     * @param {any} key Cache key
+     * @returns {any|null} Cached value or null on miss/expiry/disabled cache
+     */
+    get(key) {
+        if (this.maxEntries <= 0) {
+            return null;
+        }
+
+        const entry = this.cache.get(key);
+        if (!entry) {
+            return null;
+        }
+
+        const now = Date.now();
+        if (entry.expiresAt !== null && entry.expiresAt <= now) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        // Touch for a simple LRU-like behavior.
+        this.cache.delete(key);
+        this.cache.set(key, entry);
+        return entry.value;
+    }
+
+    /**
+     * Checks if the cache has a non-expired value for the given key.
+     * @param {any} key Cache key
+     * @returns {boolean}
+     */
+    has(key) {
+        return this.get(key) !== null;
+    }
+
+    /**
+     * Sets a value in the cache.
+     * @param {any} key Key
+     * @param {any} value Value
+     */
+    set(key, value) {
+        if (this.maxEntries <= 0) {
+            return;
+        }
+
+        const now = Date.now();
+        const expiresAt = this.ttlMs > 0 ? (now + this.ttlMs) : null;
+
+        // Overwrite while updating recency.
+        if (this.cache.has(key)) {
+            this.cache.delete(key);
+        }
+
+        this.cache.set(key, { value, expiresAt });
+        this.pruneToMaxEntries();
+    }
+
+    /**
+     * Removes a value from the cache.
+     * @param {any} key Key
+     */
+    remove(key) {
+        this.cache.delete(key);
+    }
+
+    /**
+     * Clears the cache.
+     */
+    clear() {
+        this.cache.clear();
+    }
+
+    /**
+     * Returns the current number of entries.
+     * @returns {number}
+     */
+    size() {
+        return this.cache.size;
+    }
+
+    /**
+     * Remove expired entries.
+     * @returns {number} Number of entries removed
+     */
+    pruneExpired() {
+        if (this.ttlMs <= 0) {
+            return 0;
+        }
+
+        const now = Date.now();
+        let removed = 0;
+
+        for (const [key, entry] of this.cache.entries()) {
+            if (entry.expiresAt !== null && entry.expiresAt <= now) {
+                this.cache.delete(key);
+                removed++;
+            }
+        }
+
+        return removed;
+    }
+
+    /**
+     * Enforces the maxEntries bound by evicting oldest entries.
+     */
+    pruneToMaxEntries() {
+        if (!Number.isFinite(this.maxEntries) || this.maxEntries <= 0) {
+            this.cache.clear();
+            return;
+        }
+
+        while (this.cache.size > this.maxEntries) {
+            const oldestKey = this.cache.keys().next().value;
+            if (oldestKey === undefined) {
+                break;
+            }
+            this.cache.delete(oldestKey);
+        }
+    }
+
+    /**
+     * Stops background sweeping (if enabled).
+     */
+    stop() {
+        if (this.#sweepInterval) {
+            clearInterval(this.#sweepInterval);
+            this.#sweepInterval = null;
+        }
+    }
+}
+
+/**
  * Removes color formatting from a text string.
  * @param {string} text Text with color formatting
  * @returns {string} Text without color formatting

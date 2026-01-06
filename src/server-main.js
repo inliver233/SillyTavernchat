@@ -99,8 +99,10 @@ app.use(helmet({
 app.use(compression());
 app.use(responseTime());
 
-app.use(bodyParser.json({ limit: '500mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '500mb' }));
+const jsonBodyLimit = getConfigValue('performance.maxJsonBody', '500mb');
+const urlEncodedBodyLimit = getConfigValue('performance.maxUrlEncodedBody', '500mb');
+app.use(bodyParser.json({ limit: jsonBodyLimit }));
+app.use(bodyParser.urlencoded({ extended: true, limit: urlEncodedBodyLimit }));
 
 // CORS Settings //
 const CORS = cors({
@@ -336,7 +338,9 @@ app.post('/api/ping', (request, response) => {
 
 // File uploads
 const uploadsPath = path.join(cliArgs.dataRoot, UPLOADS_DIRECTORY);
-app.use(multer({ dest: uploadsPath, limits: { fieldSize: 500 * 1024 * 1024 } }).single('avatar'));
+const maxUploadFieldMbRaw = getConfigValue('performance.maxUploadFieldMb', 500, 'number');
+const maxUploadFieldMb = (Number.isFinite(maxUploadFieldMbRaw) && maxUploadFieldMbRaw > 0) ? maxUploadFieldMbRaw : 500;
+app.use(multer({ dest: uploadsPath, limits: { fieldSize: Math.floor(maxUploadFieldMb * 1024 * 1024) } }).single('avatar'));
 app.use(multerMonkeyPatch);
 
 app.get('/version', async function (_, response) {

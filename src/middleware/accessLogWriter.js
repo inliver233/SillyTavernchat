@@ -1,11 +1,17 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { getRealIpFromHeader } from '../express-common.js';
-import { color, getConfigValue } from '../util.js';
+import { BoundedCache, color, getConfigValue } from '../util.js';
 
 const enableAccessLog = getConfigValue('logging.enableAccessLog', true, 'boolean');
 
-const knownIPs = new Set();
+// Track "known" IPs to only log the first request per IP in a time window.
+// This must be bounded to prevent unbounded growth from scanners / DoS.
+const knownIPs = new BoundedCache({
+    ttlMs: getConfigValue('logging.knownIpsTtlMs', 24 * 60 * 60 * 1000, 'number'),
+    maxEntries: getConfigValue('logging.knownIpsMaxEntries', 10_000, 'number'),
+    sweepIntervalMs: 15 * 60 * 1000,
+});
 
 export const getAccessLogPath = () => path.join(globalThis.DATA_ROOT, 'access.log');
 
@@ -35,10 +41,12 @@ export default function accessLoggerMiddleware() {
         const clientIp = getRealIpFromHeader(req);
         const userAgent = req.headers['user-agent'];
 
-        if (!knownIPs.has(clientIp)) {
-            // Log new connection
-            knownIPs.add(clientIp);
+        const isKnownIp = knownIPs.get(clientIp) !== null;
+        // Refresh TTL/recency so the cache represents "seen recently".
+        knownIPs.set(clientIp, Date.now());
 
+        if (!isKnownIp) {
+            // Log new connection
             // Write to access log if enabled
             if (enableAccessLog) {
                 console.info(color.yellow(`New connection from ${clientIp}; User Agent: ${userAgent}\n`));

@@ -3,7 +3,7 @@ import express from 'express';
 import fs from 'node:fs';
 import storage from 'node-persist';
 import fetch from 'node-fetch';
-import { getConfigValue } from '../util.js';
+import { BoundedCache, getConfigValue } from '../util.js';
 import {
     toKey,
     getUserAvatar,
@@ -169,7 +169,13 @@ function getOAuthConfig(request) {
 }
 
 // 存储OAuth状态的临时缓存
-const oauthStateCache = new Map();
+const OAUTH_STATE_TTL_MS = Math.max(1000, getConfigValue('security.oauthStateCacheTtlMs', 10 * 60 * 1000, 'number'));
+const OAUTH_STATE_MAX_ENTRIES = Math.max(1, getConfigValue('security.oauthStateCacheMaxEntries', 10_000, 'number'));
+const oauthStateCache = new BoundedCache({
+    ttlMs: OAUTH_STATE_TTL_MS,
+    maxEntries: OAUTH_STATE_MAX_ENTRIES,
+    sweepIntervalMs: 60 * 1000,
+});
 
 /**
  * 生成随机state用于OAuth安全验证
@@ -215,13 +221,6 @@ router.get('/github', async (request, response) => {
         const state = generateState();
         oauthStateCache.set(state, { provider: 'github', timestamp: Date.now() });
 
-        // 清理过期的state（超过10分钟）
-        for (const [key, value] of oauthStateCache.entries()) {
-            if (Date.now() - value.timestamp > 10 * 60 * 1000) {
-                oauthStateCache.delete(key);
-            }
-        }
-
         const params = new URLSearchParams({
             client_id: oauthConfig.github.clientId,
             redirect_uri: oauthConfig.github.callbackUrl,
@@ -249,13 +248,6 @@ router.get('/discord', async (request, response) => {
 
         const state = generateState();
         oauthStateCache.set(state, { provider: 'discord', timestamp: Date.now() });
-
-        // 清理过期的state
-        for (const [key, value] of oauthStateCache.entries()) {
-            if (Date.now() - value.timestamp > 10 * 60 * 1000) {
-                oauthStateCache.delete(key);
-            }
-        }
 
         const params = new URLSearchParams({
             client_id: oauthConfig.discord.clientId,
@@ -286,13 +278,6 @@ router.get('/linuxdo', async (request, response) => {
         const state = generateState();
         oauthStateCache.set(state, { provider: 'linuxdo', timestamp: Date.now() });
 
-        // 清理过期的state
-        for (const [key, value] of oauthStateCache.entries()) {
-            if (Date.now() - value.timestamp > 10 * 60 * 1000) {
-                oauthStateCache.delete(key);
-            }
-        }
-
         const params = new URLSearchParams({
             client_id: oauthConfig.linuxdo.clientId,
             redirect_uri: oauthConfig.linuxdo.callbackUrl,
@@ -322,7 +307,7 @@ router.get('/github/callback', async (request, response) => {
         if (!cachedState || cachedState.provider !== 'github') {
             return response.status(400).send('Invalid state parameter');
         }
-        oauthStateCache.delete(state);
+        oauthStateCache.remove(state);
 
         // 交换access token
         const tokenResponse = await fetch(oauthConfig.github.tokenUrl, {
@@ -378,7 +363,7 @@ router.get('/discord/callback', async (request, response) => {
         if (!cachedState || cachedState.provider !== 'discord') {
             return response.status(400).send('Invalid state parameter');
         }
-        oauthStateCache.delete(state);
+        oauthStateCache.remove(state);
 
         // 交换access token
         const codeStr = String(code || '');
@@ -436,7 +421,7 @@ router.get('/linuxdo/callback', async (request, response) => {
         if (!cachedState || cachedState.provider !== 'linuxdo') {
             return response.status(400).send('Invalid state parameter');
         }
-        oauthStateCache.delete(state);
+        oauthStateCache.remove(state);
 
         // 交换access token
         const codeStr = String(code || '');

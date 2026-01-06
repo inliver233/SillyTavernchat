@@ -128,6 +128,15 @@ sessionTimeout: -1
 disableCsrfProtection: false
 # Disable startup security checks - NOT RECOMMENDED
 securityOverride: false
+
+# -- SECURITY CACHE CONFIGURATION --
+security:
+  # One-time codes (MFA, email verification, password reset)
+  oneTimeCodeCacheTtlMs: 300000
+  oneTimeCodeCacheMaxEntries: 10000
+  # OAuth temporary state (anti-CSRF)
+  oauthStateCacheTtlMs: 600000
+  oauthStateCacheMaxEntries: 10000
 # -- LOGGING CONFIGURATION --
 logging:
   # Enable access logging to access.log file and console output
@@ -135,6 +144,9 @@ logging:
   enableAccessLog: true
   # Minimum log level to display in the terminal (DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3)
   minLogLevel: 0
+  # "Known IPs" cache for access log new-connection detection (bounded to prevent unbounded growth).
+  knownIpsTtlMs: 86400000
+  knownIpsMaxEntries: 10000
 # -- RATE LIMITING CONFIGURATION --
 rateLimiting:
   # Use X-Real-IP header instead of socket IP for rate limiting
@@ -184,6 +196,22 @@ performance:
   memoryCacheCapacity: '100mb'
   # Enables disk caching for character cards. Improves performances with large card libraries.
   useDiskCache: true
+  # Request body limits (keep defaults unless you know you need huge payloads).
+  # NOTE: Large limits increase DoS risk and can cause large transient memory spikes.
+  maxJsonBody: '500mb'
+  maxUrlEncodedBody: '500mb'
+  # Multer field size limit for uploads (MB).
+  maxUploadFieldMb: 500
+  # Bounded cache for /api/extra/classify to prevent unbounded growth from unique inputs.
+  classifyCacheTtlMs: 86400000
+  classifyCacheMaxEntries: 5000
+  # System monitor data pruning to avoid unbounded growth over long uptime.
+  systemMonitor:
+    pruneIntervalMs: 600000
+    keepDailyStatsDays: 365
+    pruneInactiveUserDays: 365
+    maxCharacterChatsPerUser: 500
+    maxTrackedUsers: 10000
 
 # CACHE BUSTER CONFIGURATION
 # IMPORTANT: Requires localhost or a domain with HTTPS, otherwise will not work!

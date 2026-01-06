@@ -8,9 +8,15 @@ import express from 'express';
 import { getUserAvatar, toKey, getPasswordHash, getPasswordSalt, createBackupArchive, ensurePublicDirectoriesExist, toAvatarKey, normalizeHandle } from '../users.js';
 import { SETTINGS_FILE } from '../constants.js';
 import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
-import { color, Cache } from '../util.js';
+import { BoundedCache, color, getConfigValue } from '../util.js';
 
-const RESET_CACHE = new Cache(5 * 60 * 1000);
+const ONE_TIME_CODE_CACHE_TTL_MS = Math.max(1000, getConfigValue('security.oneTimeCodeCacheTtlMs', 5 * 60 * 1000, 'number'));
+const ONE_TIME_CODE_CACHE_MAX_ENTRIES = Math.max(1, getConfigValue('security.oneTimeCodeCacheMaxEntries', 10_000, 'number'));
+const RESET_CACHE = new BoundedCache({
+    ttlMs: ONE_TIME_CODE_CACHE_TTL_MS,
+    maxEntries: ONE_TIME_CODE_CACHE_MAX_ENTRIES,
+    sweepIntervalMs: 60 * 1000,
+});
 
 export const router = express.Router();
 

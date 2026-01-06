@@ -2,6 +2,8 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { getConfigValue } from './util.js';
+
 /**
  * 系统负载监控器
  * 用于收集和统计服务器资源使用情况
@@ -15,6 +17,14 @@ class SystemMonitor {
         this.lastCpuUsage = process.cpuUsage();
         this.lastNetworkStats = this.getNetworkStats();
         this.lastDurationUpdate = 0; // 上次更新在线时长的时间
+
+        // 数据裁剪（防止长期运行导致统计数据无限增长）
+        this.pruneIntervalMs = Math.max(60 * 1000, getConfigValue('performance.systemMonitor.pruneIntervalMs', 10 * 60 * 1000, 'number'));
+        this.keepDailyStatsDays = getConfigValue('performance.systemMonitor.keepDailyStatsDays', 365, 'number'); // -1 禁用
+        this.pruneInactiveUserDays = getConfigValue('performance.systemMonitor.pruneInactiveUserDays', 365, 'number'); // -1 禁用
+        this.maxCharacterChatsPerUser = getConfigValue('performance.systemMonitor.maxCharacterChatsPerUser', 500, 'number'); // -1 禁用
+        this.maxTrackedUsers = getConfigValue('performance.systemMonitor.maxTrackedUsers', 10_000, 'number'); // -1 禁用
+        this.lastPruneTime = 0;
 
         // CPU使用率计算相关
         this.lastCpuInfo = this.getCpuInfo();
@@ -920,6 +930,8 @@ class SystemMonitor {
      */
     saveDataToDisk() {
         try {
+            this.pruneStatsIfNeeded();
+
             // 保存用户统计数据
             const userStatsObj = Object.fromEntries(this.userLoadStats);
             fs.writeFileSync(this.userStatsFile, JSON.stringify(userStatsObj, null, 2));
@@ -940,6 +952,111 @@ class SystemMonitor {
             }
         } catch (error) {
             console.error('保存数据失败:', error);
+        }
+    }
+
+    /**
+     * 根据配置定期裁剪统计数据，避免内存与持久化文件无限增长。
+     */
+    pruneStatsIfNeeded() {
+        if (!Number.isFinite(this.pruneIntervalMs) || this.pruneIntervalMs <= 0) {
+            return;
+        }
+
+        const now = Date.now();
+        if (now - this.lastPruneTime < this.pruneIntervalMs) {
+            return;
+        }
+        this.lastPruneTime = now;
+
+        try {
+            this.pruneUserLoadStats(now);
+        } catch (error) {
+            console.error('裁剪系统监控统计数据失败:', error);
+        }
+    }
+
+    /**
+     * 裁剪用户统计数据：清除过旧的 dailyStats、过多的 characterChats、长期不活跃用户等。
+     * @param {number} now 当前时间戳（毫秒）
+     */
+    pruneUserLoadStats(now) {
+        // 1) 清理长期不活跃用户（优先离线用户）
+        if (Number.isFinite(this.pruneInactiveUserDays) && this.pruneInactiveUserDays >= 0) {
+            const cutoff = now - (this.pruneInactiveUserDays * 24 * 60 * 60 * 1000);
+            for (const [handle, stats] of this.userLoadStats.entries()) {
+                const lastActivity = Number(stats?.lastActivity ?? 0);
+                const isOnline = Boolean(stats?.isOnline);
+                if (!isOnline && lastActivity > 0 && lastActivity < cutoff) {
+                    this.userLoadStats.delete(handle);
+                }
+            }
+        }
+
+        // 2) 强制限制最大用户数（防止极端情况下 Map 无界增长）
+        if (Number.isFinite(this.maxTrackedUsers) && this.maxTrackedUsers > 0 && this.userLoadStats.size > this.maxTrackedUsers) {
+            const candidates = [];
+            for (const [handle, stats] of this.userLoadStats.entries()) {
+                candidates.push({
+                    handle,
+                    lastActivity: Number(stats?.lastActivity ?? 0),
+                    isOnline: Boolean(stats?.isOnline),
+                });
+            }
+
+            candidates.sort((a, b) => {
+                // 离线优先清理，其次按 lastActivity 从旧到新
+                if (a.isOnline !== b.isOnline) return a.isOnline ? 1 : -1;
+                return a.lastActivity - b.lastActivity;
+            });
+
+            let extra = this.userLoadStats.size - this.maxTrackedUsers;
+            for (const c of candidates) {
+                if (extra <= 0) break;
+                if (this.userLoadStats.delete(c.handle)) {
+                    extra--;
+                }
+            }
+        }
+
+        // 3) 裁剪每个用户的 dailyStats / characterChats
+        const keepDailyDays = Number(this.keepDailyStatsDays);
+        const dailyCutoff = (Number.isFinite(keepDailyDays) && keepDailyDays >= 0)
+            ? now - (keepDailyDays * 24 * 60 * 60 * 1000)
+            : null;
+
+        const maxChars = Number(this.maxCharacterChatsPerUser);
+        const shouldLimitChars = Number.isFinite(maxChars) && maxChars > 0;
+
+        for (const stats of this.userLoadStats.values()) {
+            if (!stats || typeof stats !== 'object') continue;
+
+            // dailyStats: 删除超过保留天数的条目
+            if (dailyCutoff !== null && stats.dailyStats && typeof stats.dailyStats === 'object') {
+                for (const dayKey of Object.keys(stats.dailyStats)) {
+                    const dayTime = Date.parse(dayKey);
+                    if (Number.isFinite(dayTime) && dayTime < dailyCutoff) {
+                        delete stats.dailyStats[dayKey];
+                    }
+                }
+            }
+
+            // characterChats: 只保留最近 N 个角色
+            if (shouldLimitChars && stats.characterChats && typeof stats.characterChats === 'object') {
+                const names = Object.keys(stats.characterChats);
+                if (names.length > maxChars) {
+                    const sorted = names
+                        .map(name => ({ name, lastChat: Number(stats.characterChats[name]?.lastChat ?? 0) }))
+                        .sort((a, b) => b.lastChat - a.lastChat);
+
+                    const keep = new Set(sorted.slice(0, maxChars).map(x => x.name));
+                    for (const name of names) {
+                        if (!keep.has(name)) {
+                            delete stats.characterChats[name];
+                        }
+                    }
+                }
+            }
         }
     }
 

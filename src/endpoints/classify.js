@@ -1,15 +1,21 @@
 import express from 'express';
+import crypto from 'node:crypto';
 
 import { getPipeline } from '../transformers.js';
+import { BoundedCache, getConfigValue } from '../util.js';
 
 const TASK = 'text-classification';
 
 export const router = express.Router();
 
 /**
- * @type {Map<string, object>} Cache for classification results
+ * Cache for classification results.
+ * Bounded to avoid unbounded memory growth / DoS via unique inputs.
  */
-const cacheObject = new Map();
+const cacheObject = new BoundedCache({
+    ttlMs: getConfigValue('performance.classifyCacheTtlMs', 24 * 60 * 60 * 1000, 'number'),
+    maxEntries: getConfigValue('performance.classifyCacheMaxEntries', 5000, 'number'),
+});
 
 router.post('/labels', async (req, res) => {
     try {
@@ -32,15 +38,17 @@ router.post('/', async (req, res) => {
          * @returns {Promise<object>} Classification result
          */
         async function getResult(text) {
-            if (cacheObject.has(text)) {
-                return cacheObject.get(text);
-            } else {
-                const pipe = await getPipeline(TASK);
-                const result = await pipe(text, { topk: 5 });
-                result.sort((a, b) => b.score - a.score);
-                cacheObject.set(text, result);
-                return result;
+            const cacheKey = crypto.createHash('sha256').update(text).digest('hex');
+            const cached = cacheObject.get(cacheKey);
+            if (cached) {
+                return cached;
             }
+
+            const pipe = await getPipeline(TASK);
+            const result = await pipe(text, { topk: 5 });
+            result.sort((a, b) => b.score - a.score);
+            cacheObject.set(cacheKey, result);
+            return result;
         }
 
         console.debug('Classify input:', text);

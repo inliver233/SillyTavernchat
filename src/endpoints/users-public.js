@@ -4,7 +4,7 @@ import storage from 'node-persist';
 import express from 'express';
 import { RateLimiterMemory, RateLimiterRes } from 'rate-limiter-flexible';
 import { getIpFromRequest, getRealIpFromHeader } from '../express-common.js';
-import { color, Cache, getConfigValue } from '../util.js';
+import { BoundedCache, color, getConfigValue } from '../util.js';
 import { KEY_PREFIX, getUserAvatar, toKey, getPasswordHash, getPasswordSalt, getAllUserHandles, getUserDirectories, ensurePublicDirectoriesExist, normalizeHandle } from '../users.js';
 import { validateInvitationCode, useInvitationCode, getPurchaseLink, isInvitationCodesEnabled } from '../invitation-codes.js';
 import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
@@ -14,8 +14,18 @@ import { isEmailServiceAvailable, sendVerificationCode, sendPasswordRecoveryCode
 
 const DISCREET_LOGIN = getConfigValue('enableDiscreetLogin', false, 'boolean');
 const PREFER_REAL_IP_HEADER = getConfigValue('rateLimiting.preferRealIpHeader', false, 'boolean');
-const MFA_CACHE = new Cache(5 * 60 * 1000);
-const VERIFICATION_CODE_CACHE = new Cache(5 * 60 * 1000); // 验证码缓存，5分钟有效
+const ONE_TIME_CODE_CACHE_TTL_MS = Math.max(1000, getConfigValue('security.oneTimeCodeCacheTtlMs', 5 * 60 * 1000, 'number'));
+const ONE_TIME_CODE_CACHE_MAX_ENTRIES = Math.max(1, getConfigValue('security.oneTimeCodeCacheMaxEntries', 10_000, 'number'));
+const MFA_CACHE = new BoundedCache({
+    ttlMs: ONE_TIME_CODE_CACHE_TTL_MS,
+    maxEntries: ONE_TIME_CODE_CACHE_MAX_ENTRIES,
+    sweepIntervalMs: 60 * 1000,
+});
+const VERIFICATION_CODE_CACHE = new BoundedCache({
+    ttlMs: ONE_TIME_CODE_CACHE_TTL_MS,
+    maxEntries: ONE_TIME_CODE_CACHE_MAX_ENTRIES,
+    sweepIntervalMs: 60 * 1000,
+}); // 验证码缓存
 
 const getIpAddress = (request) => PREFER_REAL_IP_HEADER ? getRealIpFromHeader(request) : getIpFromRequest(request);
 
