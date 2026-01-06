@@ -1,6 +1,7 @@
 import { promises as fsPromises } from 'node:fs';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import storage from 'node-persist';
 import express from 'express';
@@ -9,6 +10,7 @@ import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
 import {
     KEY_PREFIX,
     toKey,
+    toAvatarKey,
     requireAdminMiddleware,
     getUserAvatar,
     getAllUserHandles,
@@ -18,10 +20,11 @@ import {
     ensurePublicDirectoriesExist,
     normalizeHandle,
 } from '../users.js';
-import { applyDefaultTemplateToUser } from '../default-template.js';
+import { applyDefaultTemplateToUser, getDefaultTemplateInfo } from '../default-template.js';
 import { DEFAULT_USER } from '../constants.js';
 import systemMonitor from '../system-monitor.js';
 import { isEmailServiceAvailable, sendInactiveUserDeletionNotice } from '../email-service.js';
+import { checkUserIsUnused } from '../user-data-audit.js';
 
 
 export const router = express.Router();
@@ -373,6 +376,8 @@ router.post('/delete', requireAdminMiddleware, async (request, response) => {
         }
 
         await storage.removeItem(toKey(normalizedHandle));
+        await storage.removeItem(toAvatarKey(normalizedHandle));
+        systemMonitor.resetUserStats(normalizedHandle);
 
         if (request.body.purge) {
             const directories = getUserDirectories(normalizedHandle);
@@ -508,17 +513,80 @@ router.post('/clear-all-backups', requireAdminMiddleware, async (request, respon
  */
 router.post('/delete-inactive-users', requireAdminMiddleware, async (request, response) => {
     try {
-        const { dryRun = false } = request.body;
-        const inactiveDays = 60; // 2个月（60天）
-        const inactiveThreshold = inactiveDays * 24 * 60 * 60 * 1000; // 60天的毫秒数
+        const body = request.body || {};
+        const dryRun = body.dryRun === true;
+
+        const inactiveDaysRaw = body.inactiveDays ?? 60;
+        const inactiveDays = Math.floor(Number(inactiveDaysRaw));
+        if (!Number.isFinite(inactiveDays) || inactiveDays < 1 || inactiveDays > 3650) {
+            return response.status(400).json({ error: 'inactiveDays 必须是 1-3650 的整数' });
+        }
+
+        const requireUnused = body.requireUnused === true;
+
+        const excludeActiveSubscriptions = body.excludeActiveSubscriptions !== false;
+
+        let maxStorageMB = null;
+        if (body.maxStorageMB !== null && body.maxStorageMB !== undefined && String(body.maxStorageMB).trim() !== '') {
+            const parsed = Number(body.maxStorageMB);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                return response.status(400).json({ error: 'maxStorageMB 必须是 >= 0 的数字' });
+            }
+            maxStorageMB = parsed;
+        }
+        const maxStorageBytes = maxStorageMB === null ? null : Math.floor(maxStorageMB * 1024 * 1024);
+
+        const criteria = {
+            inactiveDays,
+            requireUnused,
+            maxStorageMB,
+            excludeActiveSubscriptions,
+        };
+
+        const inactiveThreshold = inactiveDays * 24 * 60 * 60 * 1000;
         const now = Date.now();
 
+        const templateInfo = getDefaultTemplateInfo();
+        /** @type {import('../users.js').UserDirectoryList | null} */
+        let baselineDirectories = null;
+        if (templateInfo.exists && Array.isArray(templateInfo.categories) && templateInfo.categories.length > 0) {
+            // IMPORTANT: getUserDirectories() returns a cached object; never mutate it in-place.
+            baselineDirectories = { ...getUserDirectories('default-template') };
+
+            const categoryToDirKey = {
+                characters: 'characters',
+                worlds: 'worlds',
+                instruct: 'instruct',
+                context: 'context',
+                sysprompt: 'sysprompt',
+                reasoning: 'reasoning',
+                quickreplies: 'quickreplies',
+                openai_settings: 'openAI_Settings',
+                kobold_settings: 'koboldAI_Settings',
+                novel_settings: 'novelAI_Settings',
+                textgen_settings: 'textGen_Settings',
+            };
+
+            const activeDirKeys = new Set(
+                templateInfo.categories
+                    .map((categoryId) => categoryToDirKey[categoryId])
+                    .filter(Boolean),
+            );
+
+            // Only treat active template categories as baseline for "unused" checks.
+            for (const key of Object.keys(baselineDirectories)) {
+                if (!activeDirKeys.has(key)) {
+                    baselineDirectories[key] = null;
+                }
+            }
+        }
+
         // 获取所有用户
+        /** @type {import('../users.js').User[]} */
         const users = await storage.values(x => x.key.startsWith(KEY_PREFIX));
 
-        const inactiveUsers = [];
-        const results = [];
-        let totalDeletedSize = 0;
+        const candidates = [];
+        let totalCandidateSize = 0;
 
         for (const user of users) {
             // 不能删除管理员自己
@@ -533,6 +601,11 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
 
             // 不能删除管理员账户
             if (user.admin) {
+                continue;
+            }
+
+            const hasActiveSubscription = Boolean(user.expiresAt && user.expiresAt > now);
+            if (excludeActiveSubscriptions && hasActiveSubscription) {
                 continue;
             }
 
@@ -553,107 +626,190 @@ router.post('/delete-inactive-users', requireAdminMiddleware, async (request, re
             }
 
             const timeSinceLastActivity = now - lastActivityTime;
+            if (!(timeSinceLastActivity > inactiveThreshold)) {
+                continue;
+            }
+
             const daysSinceLastActivity = Math.floor(timeSinceLastActivity / (24 * 60 * 60 * 1000));
             const hasBoundEmail = typeof user.email === 'string' && user.email.trim().length > 0;
 
-            // 如果超过60天未登录
-            if (timeSinceLastActivity > inactiveThreshold) {
-                const directories = getUserDirectories(user.handle);
-                const storageSize = await calculateDirectorySize(directories.root);
+            const directories = getUserDirectories(user.handle);
+            const storageSize = await calculateDirectorySize(directories.root);
 
-                inactiveUsers.push({
-                    handle: user.handle,
-                    name: user.name,
-                    lastActivity: lastActivityTime,
-                    lastActivityFormatted: new Date(lastActivityTime).toLocaleString('zh-CN'),
-                    daysSinceLastActivity: daysSinceLastActivity,
-                    storageSize: storageSize,
-                    hasEmail: hasBoundEmail,
-                });
+            if (maxStorageBytes !== null && storageSize > maxStorageBytes) {
+                continue;
+            }
 
-                // 如果不是试运行模式，执行删除
-                if (!dryRun) {
-                    let emailNotified = false;
-                    let emailError = null;
-
-                    try {
-                        if (hasBoundEmail) {
-                            if (isEmailServiceAvailable()) {
-                                const sent = await sendInactiveUserDeletionNotice(
-                                    user.email.trim(),
-                                    user.name,
-                                    daysSinceLastActivity,
-                                );
-                                emailNotified = sent;
-                                if (!sent) {
-                                    emailError = 'Failed to send notification email';
-                                }
-                            } else {
-                                emailError = 'Email service not available';
-                            }
-                        }
-
-                        // 删除用户记录
-                        await storage.removeItem(toKey(user.handle));
-
-                        // 删除用户数据目录
-                        if (fs.existsSync(directories.root)) {
-                            await fsPromises.rm(directories.root, { recursive: true, force: true });
-                        }
-
-                        // 重置用户统计数据
-                        systemMonitor.resetUserStats(user.handle);
-
-                        totalDeletedSize += storageSize;
-                        results.push({
-                            handle: user.handle,
-                            name: user.name,
-                            success: true,
-                            deletedSize: storageSize,
-                            emailNotified: emailNotified,
-                            emailError: emailError,
-                            message: `已删除用户 ${user.handle}，释放 ${(storageSize / 1024 / 1024).toFixed(2)} MB 空间`,
-                        });
-
-                        console.info(`Deleted inactive user ${user.handle}: ${(storageSize / 1024 / 1024).toFixed(2)} MB`);
-                    } catch (error) {
-                        console.error(`Error deleting user ${user.handle}:`, error);
-                        results.push({
-                            handle: user.handle,
-                            name: user.name,
-                            success: false,
-                            error: error.message,
-                            emailNotified: emailNotified,
-                            emailError: emailError,
-                        });
-                    }
+            let unusedCheck = null;
+            if (requireUnused) {
+                unusedCheck = await checkUserIsUnused(directories, baselineDirectories);
+                if (!unusedCheck.isUnused) {
+                    continue;
                 }
             }
+
+            candidates.push({
+                handle: user.handle,
+                name: user.name,
+                lastActivity: lastActivityTime,
+                lastActivityFormatted: new Date(lastActivityTime).toLocaleString('zh-CN'),
+                daysSinceLastActivity,
+                storageSize,
+                hasEmail: hasBoundEmail,
+                expiresAt: user.expiresAt || null,
+                hasActiveSubscription,
+                isUnused: unusedCheck ? unusedCheck.isUnused : null,
+            });
+            totalCandidateSize += storageSize;
         }
 
+        const previewId = crypto
+            .createHash('sha256')
+            .update(JSON.stringify({ criteria, handles: candidates.map((u) => u.handle).sort() }))
+            .digest('hex');
+
         if (dryRun) {
-            // 试运行模式，只返回将要删除的用户列表
             return response.json({
                 success: true,
                 dryRun: true,
-                inactiveUsers: inactiveUsers,
-                totalUsers: inactiveUsers.length,
-                totalSize: inactiveUsers.reduce((sum, u) => sum + u.storageSize, 0),
-                message: `发现 ${inactiveUsers.length} 个用户超过 ${inactiveDays} 天未登录`,
-            });
-        } else {
-            // 实际删除模式
-            return response.json({
-                success: true,
-                dryRun: false,
-                deletedUsers: results.filter(r => r.success),
-                failedUsers: results.filter(r => !r.success),
-                totalDeleted: results.filter(r => r.success).length,
-                totalFailed: results.filter(r => !r.success).length,
-                totalDeletedSize: totalDeletedSize,
-                message: `已删除 ${results.filter(r => r.success).length} 个用户，释放 ${(totalDeletedSize / 1024 / 1024).toFixed(2)} MB 空间`,
+                criteria,
+                previewId,
+                inactiveUsers: candidates,
+                totalUsers: candidates.length,
+                totalSize: totalCandidateSize,
+                message: `发现 ${candidates.length} 个用户超过 ${inactiveDays} 天未登录`,
             });
         }
+
+        // 实际删除模式：需要二次确认参数，避免误触
+        const requestPreviewId = body.previewId;
+        const confirmCountRaw = body.confirmCount;
+        const confirmCount = Number(confirmCountRaw);
+
+        if (typeof requestPreviewId !== 'string' || requestPreviewId.length < 8) {
+            return response.status(400).json({ error: '缺少 previewId，请先进行预览扫描' });
+        }
+
+        if (!Number.isFinite(confirmCount) || !Number.isInteger(confirmCount) || confirmCount < 0) {
+            return response.status(400).json({ error: '缺少 confirmCount，请输入本次将删除的用户数量' });
+        }
+
+        if (requestPreviewId !== previewId) {
+            return response.status(409).json({ error: '预览结果已变化，请重新扫描后再删除' });
+        }
+
+        if (confirmCount !== candidates.length) {
+            return response.status(400).json({ error: `confirmCount 不匹配：当前将删除 ${candidates.length} 个用户` });
+        }
+
+        const results = [];
+        let totalDeletedSize = 0;
+
+        for (const candidate of candidates) {
+            let emailNotified = false;
+            let emailError = null;
+
+            try {
+                const user = await storage.getItem(toKey(candidate.handle));
+                if (!user) {
+                    results.push({
+                        handle: candidate.handle,
+                        name: candidate.name,
+                        success: false,
+                        error: 'User not found',
+                    });
+                    continue;
+                }
+
+                // 再次确认关键保护规则（防止 race / 误删）
+                if (candidate.handle === request.user.profile.handle || candidate.handle === DEFAULT_USER.handle || user.admin) {
+                    results.push({
+                        handle: candidate.handle,
+                        name: candidate.name,
+                        success: false,
+                        error: 'Protected user cannot be deleted',
+                    });
+                    continue;
+                }
+
+                if (excludeActiveSubscriptions && user.expiresAt && user.expiresAt > Date.now()) {
+                    results.push({
+                        handle: candidate.handle,
+                        name: candidate.name,
+                        success: false,
+                        error: 'User has active subscription',
+                    });
+                    continue;
+                }
+
+                const hasBoundEmail = typeof user.email === 'string' && user.email.trim().length > 0;
+                if (hasBoundEmail) {
+                    if (isEmailServiceAvailable()) {
+                        const sent = await sendInactiveUserDeletionNotice(
+                            user.email.trim(),
+                            user.name,
+                            candidate.daysSinceLastActivity,
+                        );
+                        emailNotified = sent;
+                        if (!sent) {
+                            emailError = 'Failed to send notification email';
+                        }
+                    } else {
+                        emailError = 'Email service not available';
+                    }
+                }
+
+                const directories = getUserDirectories(candidate.handle);
+
+                // 删除用户记录
+                await storage.removeItem(toKey(candidate.handle));
+                await storage.removeItem(toAvatarKey(candidate.handle));
+
+                // 删除用户数据目录
+                if (fs.existsSync(directories.root)) {
+                    await fsPromises.rm(directories.root, { recursive: true, force: true });
+                }
+
+                // 重置用户统计数据
+                systemMonitor.resetUserStats(candidate.handle);
+
+                totalDeletedSize += candidate.storageSize;
+                results.push({
+                    handle: candidate.handle,
+                    name: candidate.name,
+                    success: true,
+                    deletedSize: candidate.storageSize,
+                    emailNotified,
+                    emailError,
+                    message: `已删除用户 ${candidate.handle}，释放 ${(candidate.storageSize / 1024 / 1024).toFixed(2)} MB 空间`,
+                });
+
+                console.info(`Deleted inactive user ${candidate.handle}: ${(candidate.storageSize / 1024 / 1024).toFixed(2)} MB`);
+            } catch (error) {
+                console.error(`Error deleting user ${candidate.handle}:`, error);
+                results.push({
+                    handle: candidate.handle,
+                    name: candidate.name,
+                    success: false,
+                    error: error.message,
+                    emailNotified,
+                    emailError,
+                });
+            }
+        }
+
+        return response.json({
+            success: true,
+            dryRun: false,
+            criteria,
+            previewId,
+            deletedUsers: results.filter(r => r.success),
+            failedUsers: results.filter(r => !r.success),
+            totalDeleted: results.filter(r => r.success).length,
+            totalFailed: results.filter(r => !r.success).length,
+            totalDeletedSize,
+            message: `已删除 ${results.filter(r => r.success).length} 个用户，释放 ${(totalDeletedSize / 1024 / 1024).toFixed(2)} MB 空间`,
+        });
     } catch (error) {
         console.error('Delete inactive users failed:', error);
         return response.status(500).json({ error: '删除不活跃用户失败: ' + error.message });

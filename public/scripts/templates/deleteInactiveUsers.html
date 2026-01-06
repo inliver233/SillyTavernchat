@@ -1,0 +1,48 @@
+<div class="flex-container flexFlowColumn">
+    <h3>
+        删除不活跃用户（危险操作）
+    </h3>
+
+    <p style="margin: 10px 0;">
+        系统会先扫描并预览将要删除的用户，然后要求你输入“将删除的用户数量”进行二次确认。
+    </p>
+
+    <div class="flex-container flexFlowColumn flexGap10" style="margin: 10px 0;">
+        <div class="flex-container flexGap10 alignItemsCenter">
+            <label for="deleteInactiveUsersDays">
+                <strong>未登录/无活动天数 ≥</strong>
+            </label>
+            <input id="deleteInactiveUsersDays" type="number" class="text_pole" min="1" max="3650" step="1" value="60" style="width: 120px;">
+            <span>天</span>
+        </div>
+
+        <label class="checkbox_label" for="deleteInactiveUsersExcludeActiveSubs" style="justify-content: flex-start;">
+            <input id="deleteInactiveUsersExcludeActiveSubs" type="checkbox" checked>
+            <span>排除仍在有效期内的账户（推荐）</span>
+        </label>
+
+        <label class="checkbox_label" for="deleteInactiveUsersUseMaxSize" style="justify-content: flex-start;">
+            <input id="deleteInactiveUsersUseMaxSize" type="checkbox">
+            <span>同时满足：用户数据占用小于</span>
+            <input id="deleteInactiveUsersMaxSizeMB" type="number" class="text_pole" min="0" step="0.1" value="16" style="width: 120px;" disabled>
+            <span>MB</span>
+        </label>
+
+        <label class="checkbox_label" for="deleteInactiveUsersRequireUnused" style="justify-content: flex-start;">
+            <input id="deleteInactiveUsersRequireUnused" type="checkbox">
+            <span>同时满足：未使用过酒馆（无聊天/角色/世界书/预设/上传等）</span>
+        </label>
+    </div>
+
+    <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px; padding: 10px; margin: 10px 0;">
+        <strong style="color: #856404;">
+            <i class="fa-fw fa-solid fa-triangle-exclamation"></i>
+            注意：
+        </strong>
+        <div style="color: #856404; margin-top: 5px;">
+            <p style="margin: 5px 0;">此操作会删除用户账号记录，并清理该用户在 <code>data/&lt;handle&gt;</code> 下的全部数据。</p>
+            <p style="margin: 5px 0;">建议先使用“容量小于”和/或“未使用过酒馆”条件缩小范围，降低误删风险。</p>
+        </div>
+    </div>
+</div>
+
